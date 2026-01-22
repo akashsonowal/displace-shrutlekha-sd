@@ -2,143 +2,161 @@ import os
 import json
 import logging
 import torch
-import numpy as np
 from omegaconf import OmegaConf
-from nemo.collections.asr.models import ClusteringDiarizer, EncDecDiarLabelModel
+
 from nemo.collections.asr.models.msdd_models import NeuralDiarizer
+from nemo.collections.asr.models import EncDecDiarLabelModel
+
 from pyannote.metrics.diarization import DiarizationErrorRate
 from pyannote.core import Annotation, Segment
 
-# Initialize NeMo Logging
+# -----------------------------------------------------------------------------
+# LOGGING
+# -----------------------------------------------------------------------------
 logging.getLogger("nemo_logger").setLevel(logging.ERROR)
 
+# -----------------------------------------------------------------------------
+# DIARIZATION PIPELINE
+# -----------------------------------------------------------------------------
 class DiarizationPipeline:
-    def __init__(self, output_dir="output"):
+    def __init__(self, output_dir="diarization_output"):
         self.output_dir = output_dir
         os.makedirs(output_dir, exist_ok=True)
-        
+
+    # -------------------------------------------------------------------------
+    # MANIFEST CREATION
+    # -------------------------------------------------------------------------
     def create_manifest(self, audio_path, rttm_path=None):
-        """Creates a NeMo-compatible manifest JSON."""
         manifest_path = os.path.join(self.output_dir, "input_manifest.json")
+
         meta = {
             "audio_filepath": os.path.abspath(audio_path),
             "offset": 0,
-            "duration": None, # NeMo will calculate this
+            "duration": None,
             "label": "infer",
             "text": "-",
             "num_speakers": None,
             "rttm_filepath": os.path.abspath(rttm_path) if rttm_path else None,
-            "uem_filepath": None
+            "uem_filepath": None,
         }
-        
-        with open(manifest_path, "w") as fout:
-            fout.write(json.dumps(meta) + "\n")
-            
+
+        with open(manifest_path, "w") as f:
+            f.write(json.dumps(meta) + "\n")
+
         return manifest_path
 
+    # -------------------------------------------------------------------------
+    # MSDD DIARIZATION
+    # -------------------------------------------------------------------------
     def run_msdd(self, audio_file):
-        """
-        Runs the Multi-scale Diarization Decoder (MSDD) pipeline.
-        This uses TitaNet for embeddings + Clustering + MSDD for refinement.
-        """
-        print(f"\n[INFO] Running MSDD Diarization on {audio_file}...")
-        
-        # 1. Create Config for MSDD
-        # We load the standard telephonic MSDD config structure
-        config_url = "https://raw.githubusercontent.com/NVIDIA/NeMo/main/examples/speaker_tasks/diarization/conf/inference/diar_infer_telephonic.yaml"
-        config = OmegaConf.load(OmegaConf.from_cli_loader([f"diarizer.manifest_filepath={self.create_manifest(audio_file)}",
-                                                          f"diarizer.out_dir={self.output_dir}"]))
-        
-        # Configure standard Pretrained Models
-        config.diarizer.vad.model_path = "vad_multilingual_marblenet"
-        config.diarizer.speaker_embeddings.model_path = "titanet_large"
-        config.diarizer.msdd_model.model_path = "diar_msdd_telephonic" 
-        
-        # Enable MSDD
-        config.diarizer.msdd_model.parameters.sigmoid_threshold = [0.7] 
-        
-        # Run Pipeline
-        model = NeuralDiarizer(cfg=config)
-        model.diarize()
-        
-        # The output RTTM is saved by NeMo in {output_dir}/pred_rttms/
-        base_name = os.path.splitext(os.path.basename(audio_file))[0]
-        generated_rttm = os.path.join(self.output_dir, "pred_rttms", f"{base_name}.rttm")
-        return generated_rttm
+        print(f"\n[INFO] Running MSDD diarization on {audio_file}")
 
-    def run_sortformer(self, audio_file):
-        """
-        Runs the Sortformer End-to-End Diarization model.
-        """
-        print(f"\n[INFO] Running Sortformer on {audio_file}...")
-        
         manifest_path = self.create_manifest(audio_file)
-        
-        # Load Sortformer from NGC
-        # Note: Check for exact model name on NGC, usually 'diar_sortformer_telephonic' or similar
-        # If specific checkpoint is needed, replace model_name with .nemo file path
-        model = EncDecDiarLabelModel.from_pretrained(model_name="diar_sortformer_telephonic")
-        
-        # Run Inference
-        model.diarize(
-            paths2audio_files=[audio_file], 
-            batch_size=1,
-            out_dir=self.output_dir
-        )
-        
-        base_name = os.path.splitext(os.path.basename(audio_file))[0]
-        generated_rttm = os.path.join(self.output_dir, "pred_rttms", f"{base_name}.rttm")
-        return generated_rttm
 
+        # Download NeMo diarization config if needed
+        config_path = "diar_infer_telephonic.yaml"
+        if not os.path.exists(config_path):
+            os.system(
+                "wget https://raw.githubusercontent.com/NVIDIA/NeMo/main/"
+                "examples/speaker_tasks/diarization/conf/inference/"
+                "diar_infer_telephonic.yaml"
+            )
+
+        # Load base config
+        cfg = OmegaConf.load(config_path)
+
+        # Override required fields
+        override_cfg = OmegaConf.from_dotlist([
+            f"diarizer.manifest_filepath={manifest_path}",
+            f"diarizer.out_dir={self.output_dir}",
+        ])
+        cfg = OmegaConf.merge(cfg, override_cfg)
+
+        # Set pretrained models
+        cfg.diarizer.vad.model_path = "vad_multilingual_marblenet"
+        cfg.diarizer.speaker_embeddings.model_path = "titanet_large"
+        cfg.diarizer.msdd_model.model_path = "diar_msdd_telephonic"
+
+        # Optional tuning
+        cfg.diarizer.msdd_model.parameters.sigmoid_threshold = [0.7]
+
+        # Run diarization
+        diarizer = NeuralDiarizer(cfg=cfg)
+        diarizer.diarize()
+
+        base = os.path.splitext(os.path.basename(audio_file))[0]
+        return os.path.join(self.output_dir, "pred_rttms", f"{base}.rttm")
+
+    # -------------------------------------------------------------------------
+    # SORTFORMER DIARIZATION (END-TO-END)
+    # -------------------------------------------------------------------------
+    def run_sortformer(self, audio_file):
+        print(f"\n[INFO] Running Sortformer diarization on {audio_file}")
+
+        model = EncDecDiarLabelModel.from_pretrained(
+            model_name="diar_sortformer_telephonic"
+        )
+
+        model.diarize(
+            paths2audio_files=[audio_file],
+            batch_size=1,
+            out_dir=self.output_dir,
+        )
+
+        base = os.path.splitext(os.path.basename(audio_file))[0]
+        return os.path.join(self.output_dir, "pred_rttms", f"{base}.rttm")
+
+
+# -----------------------------------------------------------------------------
+# DER CALCULATION
+# -----------------------------------------------------------------------------
 def calculate_der(reference_rttm, hypothesis_rttm):
-    """
-    Calculates DER using pyannote.metrics.
-    """
     def load_rttm(path):
-        annotations = Annotation()
-        with open(path, 'r') as f:
+        ann = Annotation()
+        with open(path) as f:
             for line in f:
-                parts = line.strip().split()
-                # RTTM format: SPEAKER file 1 start duration <NA> <NA> label <NA> <NA>
-                start = float(parts[3])
-                duration = float(parts[4])
-                label = parts[7]
-                annotations[Segment(start, start + duration)] = label
-        return annotations
+                p = line.strip().split()
+                start = float(p[3])
+                dur = float(p[4])
+                speaker = p[7]
+                ann[Segment(start, start + dur)] = speaker
+        return ann
 
     ref = load_rttm(reference_rttm)
     hyp = load_rttm(hypothesis_rttm)
 
     metric = DiarizationErrorRate()
-    der = metric(ref, hyp)
-    
-    return der
+    return metric(ref, hyp)
 
-# --- MAIN EXECUTION BLOCK ---
+
+# -----------------------------------------------------------------------------
+# MAIN
+# -----------------------------------------------------------------------------
 if __name__ == "__main__":
-    
-    # INPUTS
-    WAV_FILE = "sample_audio.wav"
-    GROUND_TRUTH_RTTM = "sample_audio.rttm" # Optional, for DER calculation
-    
-    # CHOOSE MODEL: 'msdd' or 'sortformer'
-    MODEL_TYPE = 'msdd' 
+
+    WAV_FILE = "/content/Track_1_SD_DevData_1/Track_1_SD_DevData_1/Hindi/data/wav/2006763.wav"
+    GROUND_TRUTH_RTTM = (
+        "/content/Track_1_SD_DevData_1/Track_1_SD_DevData_1/"
+        "Hindi/data/rttm/2006763_SPEAKER.rttm"
+    )
+
+    MODEL_TYPE = "msdd"  # "msdd" or "sortformer"
 
     pipeline = DiarizationPipeline(output_dir="my_diarization_results")
 
-    # 1. Run Diarization
-    if MODEL_TYPE == 'msdd':
+    # Run diarization
+    if MODEL_TYPE == "msdd":
         pred_rttm = pipeline.run_msdd(WAV_FILE)
     else:
         pred_rttm = pipeline.run_sortformer(WAV_FILE)
 
-    print(f"\n[SUCCESS] RTTM generated at: {pred_rttm}")
+    print(f"\n[SUCCESS] RTTM saved at: {pred_rttm}")
 
-    # 2. Calculate DER (if ground truth exists)
+    # Compute DER if GT exists
     if os.path.exists(GROUND_TRUTH_RTTM):
-        score = calculate_der(GROUND_TRUTH_RTTM, pred_rttm)
-        print(f"--------------------------------------")
-        print(f"Diarization Error Rate (DER): {score * 100:.2f}%")
-        print(f"--------------------------------------")
+        der = calculate_der(GROUND_TRUTH_RTTM, pred_rttm)
+        print("-----------------------------------")
+        print(f"Diarization Error Rate (DER): {der * 100:.2f}%")
+        print("-----------------------------------")
     else:
-        print("No ground truth RTTM provided. Skipping DER calculation.")
+        print("Ground-truth RTTM not found. DER skipped.")
