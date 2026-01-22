@@ -1,0 +1,17 @@
+# Core Frameworks
+torch>=1.13.0
+torchaudio>=0.13.0
+numpy
+
+# NVIDIA NeMo Toolkit (includes ASR and Diarization modules)
+nemo_toolkit[asr]>=1.20.0
+
+# Configuration Management (Required by NeMo)
+omegaconf
+hydra-core
+
+# Audio Processing & Scoring
+pyannote.core
+pyannote.metrics
+scipy
+pydub
